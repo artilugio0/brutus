@@ -1,0 +1,6 @@
+GET /test/endpoint?q1=1&q2=2#some-fragment HTTP/1.1
+Content-Type: application/json
+Content-Length: 10
+Host: example.com
+
+0123456789

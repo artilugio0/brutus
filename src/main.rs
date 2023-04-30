@@ -1,6 +1,7 @@
 use async_channel::{bounded, Receiver, Sender};
 use clap::{Parser, Subcommand};
-use std::sync;
+use std::{collections::HashMap, sync};
+use tokio::io::AsyncReadExt;
 
 const DEFAULT_PORT_RANGE: &str = "1-65535";
 
@@ -60,7 +61,8 @@ enum Commands {
     },
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
 
     match args.command {
@@ -72,18 +74,18 @@ fn main() {
             target,
             wordlist,
             rate,
-        } => http_brute_force(raw_request, status, body, not_body, target, wordlist, rate),
+        } => http_brute_force(raw_request, status, body, not_body, target, wordlist, rate).await,
 
         Commands::PortScan {
             target,
             rate,
             port_range,
-        } => port_scan(target, rate, port_range),
+        } => port_scan(target, rate, port_range).await,
     }
 }
 
-fn http_brute_force(
-    request: String,
+async fn http_brute_force(
+    raw_request_path: String,
     status: Option<u32>,
     body: Option<String>,
     not_body: Option<String>,
@@ -92,23 +94,80 @@ fn http_brute_force(
     rate: u32,
 ) {
     println!("Http");
-    println!("\trequest: {}", request);
+    println!("\traw_request_path: {}", raw_request_path);
     println!("\tstatus: {:?}", status);
     println!("\tbody: {:?}", body);
     println!("\tnot_body: {:?}", not_body);
     println!("\ttarget: {}", target);
     println!("\twordlist: {}", wordlist);
     println!("\trate: {}", rate);
+
+    // Read the raw request from the file
+    let mut req_file = tokio::fs::File::open(raw_request_path).await.unwrap();
+    let mut raw_request = Vec::new();
+    req_file.read_to_end(&mut raw_request).await.unwrap();
+
+    // Parse request
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut headers);
+
+    let bytes_read = req.parse(&raw_request).unwrap().unwrap();
+
+    let content_length = req
+        .headers
+        .iter()
+        .filter(|&h| h.name.to_lowercase() == "content-length")
+        .next()
+        .unwrap()
+        .value;
+
+    let content_length = String::from_utf8(content_length.to_vec())
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+
+    // Build reqwest::Request
+    let url = reqwest::Url::parse(&target)
+        .unwrap()
+        .join(req.path.unwrap())
+        .unwrap();
+
+    let mut request = reqwest::Request::new(req.method.unwrap().try_into().unwrap(), url);
+
+    let mut headers = HashMap::new();
+    for h in req.headers.iter() {
+        headers.insert(
+            h.name.to_string(),
+            String::from_utf8_lossy(h.value).to_string(),
+        );
+    }
+    let headers: reqwest::header::HeaderMap = (&headers).try_into().unwrap();
+    request.headers_mut().extend(headers);
+
+    let request_body = request.body_mut();
+    let body = raw_request[bytes_read..bytes_read + content_length]
+        .to_vec()
+        .into();
+    *request_body = Some(body);
+
+    eprintln!("reqwest request: {request:?}");
+    eprintln!("reqwest body: {:?}", request.body().unwrap().as_bytes());
+
+    let (req_tx, resp_rx) = rate_limiting_requests(rate);
+    req_tx.send(request).await.unwrap();
+    let response = resp_rx.recv().await;
+
+    eprintln!("response: {response:?}");
 }
 
-fn port_scan(target: String, rate: u32, port_range: String) {
+async fn port_scan(target: String, rate: u32, port_range: String) {
     println!("PortScan");
     println!("\ttarget: {}", target);
     println!("\trate: {}", rate);
     println!("\tport_range: {}", port_range);
 }
 
-async fn rate_limiting_requests(
+fn rate_limiting_requests(
     reqs_per_sec: u32,
 ) -> (
     Sender<reqwest::Request>,
