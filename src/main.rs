@@ -90,74 +90,91 @@ async fn http_brute_force(
     body: Option<String>,
     not_body: Option<String>,
     target: String,
-    wordlist: String,
+    wordlist_path: String,
     rate: u32,
 ) {
-    println!("Http");
-    println!("\traw_request_path: {}", raw_request_path);
-    println!("\tstatus: {:?}", status);
-    println!("\tbody: {:?}", body);
-    println!("\tnot_body: {:?}", not_body);
-    println!("\ttarget: {}", target);
-    println!("\twordlist: {}", wordlist);
-    println!("\trate: {}", rate);
+    // Read the contents of the wordlist
+    let mut wordlist_contents = String::new();
+    let mut wordlist_file = tokio::fs::File::open(wordlist_path).await.unwrap();
+    wordlist_file
+        .read_to_string(&mut wordlist_contents)
+        .await
+        .unwrap();
+    let wordlist = wordlist_contents
+        .lines()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>();
 
     // Read the raw request from the file
     let mut req_file = tokio::fs::File::open(raw_request_path).await.unwrap();
     let mut raw_request = Vec::new();
     req_file.read_to_end(&mut raw_request).await.unwrap();
 
-    // Parse request
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut req = httparse::Request::new(&mut headers);
-
-    let bytes_read = req.parse(&raw_request).unwrap().unwrap();
-
-    let content_length = req
-        .headers
-        .iter()
-        .filter(|&h| h.name.to_lowercase() == "content-length")
-        .next()
-        .unwrap()
-        .value;
-
-    let content_length = String::from_utf8(content_length.to_vec())
-        .unwrap()
-        .parse::<usize>()
-        .unwrap();
-
-    // Build reqwest::Request
-    let url = reqwest::Url::parse(&target)
-        .unwrap()
-        .join(req.path.unwrap())
-        .unwrap();
-
-    let mut request = reqwest::Request::new(req.method.unwrap().try_into().unwrap(), url);
-
-    let mut headers = HashMap::new();
-    for h in req.headers.iter() {
-        headers.insert(
-            h.name.to_string(),
-            String::from_utf8_lossy(h.value).to_string(),
-        );
-    }
-    let headers: reqwest::header::HeaderMap = (&headers).try_into().unwrap();
-    request.headers_mut().extend(headers);
-
-    let request_body = request.body_mut();
-    let body = raw_request[bytes_read..bytes_read + content_length]
-        .to_vec()
-        .into();
-    *request_body = Some(body);
-
-    eprintln!("reqwest request: {request:?}");
-    eprintln!("reqwest body: {:?}", request.body().unwrap().as_bytes());
-
     let (req_tx, resp_rx) = rate_limiting_requests(rate);
-    req_tx.send(request).await.unwrap();
-    let response = resp_rx.recv().await;
 
-    eprintln!("response: {response:?}");
+    let req_count = wordlist.len();
+    let resp_rx = resp_rx.clone();
+    let handle = tokio::spawn(async move {
+        for _ in 0..req_count {
+            let response = resp_rx.recv().await.unwrap();
+            eprintln!("response: {response:?}");
+        }
+    });
+
+    for word in wordlist.into_iter() {
+        // Parse request
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut req = httparse::Request::new(&mut headers);
+
+        let raw_request = String::from_utf8_lossy(&raw_request).replace("FUZZ", word);
+        let raw_request = raw_request.as_bytes();
+
+        let bytes_read = req.parse(&raw_request).unwrap().unwrap();
+
+        let content_length = req
+            .headers
+            .iter()
+            .filter(|&h| h.name.to_lowercase() == "content-length")
+            .next()
+            .unwrap()
+            .value;
+
+        let content_length = String::from_utf8(content_length.to_vec())
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+
+        // Build reqwest::Request
+        let url = reqwest::Url::parse(&target)
+            .unwrap()
+            .join(req.path.unwrap())
+            .unwrap();
+
+        let mut request = reqwest::Request::new(req.method.unwrap().try_into().unwrap(), url);
+
+        let mut headers = HashMap::new();
+        for h in req.headers.iter() {
+            headers.insert(
+                h.name.to_string(),
+                String::from_utf8_lossy(h.value).to_string(),
+            );
+        }
+        let headers: reqwest::header::HeaderMap = (&headers).try_into().unwrap();
+        request.headers_mut().extend(headers);
+
+        let request_body = request.body_mut();
+        let body = raw_request[bytes_read..bytes_read + content_length]
+            .to_vec()
+            .into();
+        *request_body = Some(body);
+
+        eprintln!("reqwest request: {request:?}");
+        eprintln!("reqwest body: {:?}", request.body().unwrap().as_bytes());
+
+        req_tx.send(request).await.unwrap();
+    }
+
+    handle.await.unwrap();
 }
 
 async fn port_scan(target: String, rate: u32, port_range: String) {
