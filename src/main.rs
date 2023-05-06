@@ -22,7 +22,7 @@ enum Commands {
 
         /// Status code to be considered a success
         #[arg(short, long)]
-        status: Option<u32>,
+        status: Option<u16>,
 
         /// String to be found in the response body to be considered a success
         #[arg(short, long)]
@@ -86,7 +86,7 @@ async fn main() {
 
 async fn http_brute_force(
     raw_request_path: String,
-    status: Option<u32>,
+    status: Option<u16>,
     body: Option<String>,
     not_body: Option<String>,
     target: String,
@@ -116,8 +116,34 @@ async fn http_brute_force(
     let resp_rx = resp_rx.clone();
     let handle = tokio::spawn(async move {
         for _ in 0..req_count {
-            let response = resp_rx.recv().await.unwrap();
-            eprintln!("response: {response:?}");
+            let (response_result, word) = resp_rx.recv().await.unwrap();
+            let response = response_result.unwrap();
+
+            if let Some(status) = status {
+                if response.status().as_u16() != status {
+                    eprintln!("{word}\t\t\t\tFAILED");
+                    continue;
+                }
+            }
+
+            let body_bytes = response.bytes().await.unwrap();
+            let body_string = String::from_utf8_lossy(&body_bytes);
+
+            if let Some(body_content) = body.clone() {
+                if !body_string.contains(&body_content) {
+                    eprintln!("{word}\t\t\t\tFAILED");
+                    continue;
+                }
+            }
+
+            if let Some(not_body_content) = not_body.clone() {
+                if body_string.contains(&not_body_content) {
+                    eprintln!("{word}\t\t\t\tFAILED");
+                    continue;
+                }
+            }
+
+            eprintln!("{word}\t\t\t\tSUCCESS");
         }
     });
 
@@ -130,19 +156,6 @@ async fn http_brute_force(
         let raw_request = raw_request.as_bytes();
 
         let bytes_read = req.parse(&raw_request).unwrap().unwrap();
-
-        let content_length = req
-            .headers
-            .iter()
-            .filter(|&h| h.name.to_lowercase() == "content-length")
-            .next()
-            .unwrap()
-            .value;
-
-        let content_length = String::from_utf8(content_length.to_vec())
-            .unwrap()
-            .parse::<usize>()
-            .unwrap();
 
         // Build reqwest::Request
         let url = reqwest::Url::parse(&target)
@@ -163,15 +176,10 @@ async fn http_brute_force(
         request.headers_mut().extend(headers);
 
         let request_body = request.body_mut();
-        let body = raw_request[bytes_read..bytes_read + content_length]
-            .to_vec()
-            .into();
+        let body = raw_request[bytes_read..].to_vec().into();
         *request_body = Some(body);
 
-        eprintln!("reqwest request: {request:?}");
-        eprintln!("reqwest body: {:?}", request.body().unwrap().as_bytes());
-
-        req_tx.send(request).await.unwrap();
+        req_tx.send((request, word.to_string())).await.unwrap();
     }
 
     handle.await.unwrap();
@@ -187,11 +195,12 @@ async fn port_scan(target: String, rate: u32, port_range: String) {
 fn rate_limiting_requests(
     reqs_per_sec: u32,
 ) -> (
-    Sender<reqwest::Request>,
-    Receiver<Result<reqwest::Response, reqwest::Error>>,
+    Sender<(reqwest::Request, String)>,
+    Receiver<(Result<reqwest::Response, reqwest::Error>, String)>,
 ) {
-    let (request_tx, request_rx) = bounded::<reqwest::Request>(1);
-    let (responses_tx, responses_rx) = bounded::<Result<reqwest::Response, reqwest::Error>>(1);
+    let (request_tx, request_rx) = bounded::<(reqwest::Request, String)>(1);
+    let (responses_tx, responses_rx) =
+        bounded::<(Result<reqwest::Response, reqwest::Error>, String)>(1);
 
     let client = reqwest::Client::new();
 
@@ -204,7 +213,7 @@ fn rate_limiting_requests(
         let ongoing_requests = ongoing_requests.clone();
 
         tokio::spawn(async move {
-            while let Ok(request) = request_rx.recv().await {
+            while let Ok((request, word)) = request_rx.recv().await {
                 // wait until we have less than reqs_per_sec ongoing requests
                 loop {
                     {
@@ -215,7 +224,6 @@ fn rate_limiting_requests(
                         }
 
                         *ongoing_requests += 1;
-                        eprintln!("ongoing requests: {}", *ongoing_requests);
                         break;
                     }
                 }
@@ -240,7 +248,7 @@ fn rate_limiting_requests(
                     *ongoing_requests -= 1;
                 }
 
-                responses_tx.send(result).await.unwrap();
+                responses_tx.send((result, word)).await.unwrap();
             }
         });
     }
