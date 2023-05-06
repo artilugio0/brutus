@@ -152,7 +152,9 @@ async fn http_brute_force(
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
 
-        let raw_request = String::from_utf8_lossy(&raw_request).replace("FUZZ", word);
+        let raw_request = String::from_utf8_lossy(&raw_request)
+            .trim_end()
+            .replace("FUZZ", word);
         let raw_request = raw_request.as_bytes();
 
         let bytes_read = req.parse(&raw_request).unwrap().unwrap();
