@@ -1,6 +1,6 @@
 use async_channel::{bounded, Receiver, Sender};
 use clap::{Parser, Subcommand};
-use std::{collections::HashMap, sync};
+use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
 
 const DEFAULT_PORT_RANGE: &str = "1-65535";
@@ -206,28 +206,22 @@ fn rate_limiting_requests(
 
     let client = reqwest::Client::new();
 
-    let ongoing_requests = sync::Arc::new(tokio::sync::Mutex::new(0));
-
     for _ in 0..reqs_per_sec {
         let request_rx = request_rx.clone();
         let responses_tx = responses_tx.clone();
         let client = client.clone();
-        let ongoing_requests = ongoing_requests.clone();
 
         tokio::spawn(async move {
-            while let Ok((request, word)) = request_rx.recv().await {
-                // wait until we have less than reqs_per_sec ongoing requests
-                loop {
-                    {
-                        let mut ongoing_requests = ongoing_requests.lock().await;
-                        if *ongoing_requests >= reqs_per_sec {
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            continue;
-                        }
+            let mut last_request = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap();
 
-                        *ongoing_requests += 1;
-                        break;
-                    }
+            while let Ok((request, word)) = request_rx.recv().await {
+                let time_since_last_request = last_request.elapsed().as_millis();
+                if time_since_last_request < 1000 {
+                    let remaining_waiting_time = 1000 - time_since_last_request as u64;
+                    let sleep_time = std::time::Duration::from_millis(remaining_waiting_time);
+                    tokio::time::sleep(sleep_time).await;
                 }
 
                 // make the request
@@ -238,17 +232,11 @@ fn rate_limiting_requests(
                         break;
                     }
 
-                    eprintln!("retrying...");
-
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     let req = request.try_clone().unwrap();
                     result = client.execute(req).await;
                 }
-
-                {
-                    let mut ongoing_requests = ongoing_requests.lock().await;
-                    *ongoing_requests -= 1;
-                }
+                last_request = std::time::Instant::now();
 
                 responses_tx.send((result, word)).await.unwrap();
             }
